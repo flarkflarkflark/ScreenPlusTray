@@ -6,6 +6,35 @@ This is an unofficial companion tool. Not affiliated with or endorsed by the Scr
 
 `screenplus-tray` communicates directly with an already-installed Screen+ service over its Unix domain socket (`$XDG_RUNTIME_DIR/screenplus.sock`) without modifying Screen+ itself.
 
+## Install
+
+Install the prebuilt `x86_64` binary into `~/.local` (no compiler or `sudo` needed):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/flarkflarkflark/ScreenPlusTray/master/install.sh | sh
+```
+
+<small>Prefer to inspect the script before running it?
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/flarkflarkflark/ScreenPlusTray/master/install.sh
+less install.sh
+sh install.sh
+```
+</small>
+
+**Update** to the latest release by running the same command again.
+
+**Uninstall** (stops the tray, removes the login autostart entry, and deletes all installed files):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/flarkflarkflark/ScreenPlusTray/master/install.sh | sh -s -- --uninstall
+```
+
+<small>Additional installer options (`| sh -s -- <options>`): `--no-autostart`, `--prefix DIR` (default `~/.local`), `--version vX.Y.Z`.</small>
+
+---
+
 ## Features
 
 - **Zero heavy dependencies**: pure C17 using only `libc` and `libdbus-1` (no GTK, Qt, SDL, libappindicator, or libpng).
@@ -29,13 +58,39 @@ This is an unofficial companion tool. Not affiliated with or endorsed by the Scr
   - Automatically re-registers with `org.kde.StatusNotifierWatcher` whenever the watcher (re)appears on the session bus (e.g., when Waybar starts or restarts on Hyprland).
   - Single-instance lock via `org.screenplus.Tray`.
 
-## Requirements
+## Usage
+
+```bash
+# Start the tray icon
+screenplus-tray
+
+# Enable or disable starting screenplus-tray automatically at login
+# (writes or removes ~/.config/autostart/screenplus-tray.desktop)
+screenplus-tray --autostart on
+screenplus-tray --autostart off
+
+# Print the current parsed Screen+ state and exit
+screenplus-tray --dump
+
+# Print version
+screenplus-tray --version
+```
+
+On **Hyprland**, you can also launch `screenplus-tray` from `hyprland.conf`:
+
+```ini
+exec-once = screenplus-tray
+```
+
+## Build from source
+
+### Requirements
 
 - A working installation of **Screen+ for Linux** (`screenplus` on `PATH`)
 - CMake $\ge 3.16$, Ninja, a C17 compiler (`gcc` or `clang`)
 - `pkg-config` and `libdbus-1` development headers (`libdbus-1-dev` on Debian/Ubuntu, `dbus-devel` on Fedora, `dbus` on Arch)
 
-## Build & Install
+### Compile & Install
 
 By default, `CMAKE_INSTALL_PREFIX` defaults to `~/.local`:
 
@@ -51,27 +106,6 @@ To install to a custom prefix (such as `/usr/local`):
 cmake -S . -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr/local
 cmake --build build
 cmake --install build
-```
-
-## Usage
-
-```bash
-# Start the tray icon
-screenplus-tray
-
-# Enable or disable starting screenplus-tray automatically at login
-# (writes or removes ~/.config/autostart/screenplus-tray.desktop)
-screenplus-tray --autostart on
-screenplus-tray --autostart off
-
-# Print the current parsed Screen+ state and exit
-screenplus-tray --dump
-```
-
-On **Hyprland**, you can also launch `screenplus-tray` from `hyprland.conf`:
-
-```ini
-exec-once = screenplus-tray
 ```
 
 ## Known Limitations

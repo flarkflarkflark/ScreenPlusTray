@@ -16,6 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef SP_TRAY_VERSION
+#define SP_TRAY_VERSION "0.1.0"
+#endif
+
 #define SP_TRAY_BUS_NAME "org.screenplus.Tray"
 #define WATCHER_MATCH_RULE \
     "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus'," \
@@ -168,7 +172,7 @@ static int handle_autostart(const char *arg)
 
 static void print_usage(void)
 {
-    puts("Usage: screenplus-tray [--dump] [--autostart on|off] [--help]");
+    puts("Usage: screenplus-tray [--dump] [--autostart on|off] [--version] [--help]");
 }
 
 int main(int argc, char **argv)
@@ -176,6 +180,10 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage();
+            return 0;
+        }
+        if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-v")) {
+            puts("screenplus-tray " SP_TRAY_VERSION);
             return 0;
         }
         if (!strcmp(argv[i], "--dump")) {

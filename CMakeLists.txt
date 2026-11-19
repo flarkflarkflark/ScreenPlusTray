@@ -24,6 +24,7 @@ add_executable(screenplus-tray
 target_compile_definitions(screenplus-tray PRIVATE
     _POSIX_C_SOURCE=200809L
     _DEFAULT_SOURCE
+    SP_TRAY_VERSION="${PROJECT_VERSION}"
     SP_INSTALL_ICON_DIR="${CMAKE_INSTALL_PREFIX}/share/screenplus-tray/icons"
 )
 

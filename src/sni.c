@@ -121,12 +121,6 @@ static int has_tray_icon(const char *dir)
 
 static void resolve_icon_theme_path(char *out, size_t cap)
 {
-    /* 1. Installed share dir (<prefix>/share/screenplus-tray/icons) first */
-    if (has_tray_icon(SP_INSTALL_ICON_DIR)) {
-        snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
-        return;
-    }
-
     char exe[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n > 0) {
@@ -137,14 +131,20 @@ static void resolve_icon_theme_path(char *out, size_t cap)
             char cand[PATH_MAX];
             char real[PATH_MAX];
 
-            /* Relative to installed binary: <prefix>/bin/screenplus-tray -> ../share/screenplus-tray/icons */
+            /* 1. Relative to installed binary: <prefix>/bin/screenplus-tray -> ../share/screenplus-tray/icons */
             int w = snprintf(cand, sizeof cand, "%s/../share/screenplus-tray/icons", exe);
             if (w > 0 && (size_t)w < sizeof cand && realpath(cand, real) && has_tray_icon(real)) {
                 snprintf(out, cap, "%s", real);
                 return;
             }
 
-            /* 2. Development fallback: <build>/screenplus-tray -> ../data/icons */
+            /* 2. Compile-time install prefix (<prefix>/share/screenplus-tray/icons) */
+            if (has_tray_icon(SP_INSTALL_ICON_DIR)) {
+                snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
+                return;
+            }
+
+            /* 3. Development fallback: <build>/screenplus-tray -> ../data/icons */
             w = snprintf(cand, sizeof cand, "%s/../data/icons", exe);
             if (w > 0 && (size_t)w < sizeof cand && realpath(cand, real) && has_tray_icon(real)) {
                 snprintf(out, cap, "%s", real);
@@ -153,6 +153,10 @@ static void resolve_icon_theme_path(char *out, size_t cap)
         }
     }
 
+    if (has_tray_icon(SP_INSTALL_ICON_DIR)) {
+        snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
+        return;
+    }
     snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
 }
 
