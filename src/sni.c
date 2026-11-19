@@ -1,17 +1,22 @@
 /* org.kde.StatusNotifierItem D-Bus implementation.
  * Adapted from SDL3 (src/tray/unix/SDL_dbustray.c), zlib License. */
 #include "sni.h"
+#include "dbusmenu.h"
+#include "menu.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SNI_INTERFACE         "org.kde.StatusNotifierItem"
 #define SNI_WATCHER_SERVICE   "org.kde.StatusNotifierWatcher"
 #define SNI_WATCHER_PATH      "/StatusNotifierWatcher"
 #define SNI_WATCHER_INTERFACE "org.kde.StatusNotifierWatcher"
+
+#define SCROLL_DEBOUNCE_MS    150
 
 #ifndef SP_INSTALL_ICON_DIR
 #define SP_INSTALL_ICON_DIR ""
@@ -77,10 +82,38 @@ static struct {
     char        tooltip_title[192];
     char        tooltip_body[128];
     const char *menu_path;
+
+    /* Scroll accumulation and debouncing */
+    int         scroll_accum;
+    int         scroll_pending;
+    int64_t     scroll_due_ms;
 } g_sni;
+
+static int64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+static int has_tray_icon(const char *dir)
+{
+    if (!dir || !dir[0]) return 0;
+    char p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/screenplus-tray.png", dir);
+    if (access(p, R_OK) == 0) return 1;
+    snprintf(p, sizeof p, "%s/hicolor/256x256/apps/screenplus-tray.png", dir);
+    return access(p, R_OK) == 0;
+}
 
 static void resolve_icon_theme_path(char *out, size_t cap)
 {
+    /* 1. Installed share dir (<prefix>/share/screenplus-tray/icons) first */
+    if (has_tray_icon(SP_INSTALL_ICON_DIR)) {
+        snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
+        return;
+    }
+
     char exe[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n > 0) {
@@ -88,40 +121,26 @@ static void resolve_icon_theme_path(char *out, size_t cap)
         char *slash = strrchr(exe, '/');
         if (slash) {
             *slash = '\0';
-            /* Build tree: <build>/screenplus-tray -> ../data/icons */
             char cand[PATH_MAX];
-            int w = snprintf(cand, sizeof cand, "%s/../data/icons", exe);
-            if (w > 0 && (size_t)w < sizeof cand) {
-                char real[PATH_MAX];
-                if (realpath(cand, real)) {
-                    char test_png[PATH_MAX + 64];
-                    snprintf(test_png, sizeof test_png, "%s/screenplus-tray.png", real);
-                    if (access(test_png, R_OK) == 0) {
-                        snprintf(out, cap, "%s", real);
-                        return;
-                    }
-                }
+            char real[PATH_MAX];
+
+            /* Relative to installed binary: <prefix>/bin/screenplus-tray -> ../share/screenplus-tray/icons */
+            int w = snprintf(cand, sizeof cand, "%s/../share/screenplus-tray/icons", exe);
+            if (w > 0 && (size_t)w < sizeof cand && realpath(cand, real) && has_tray_icon(real)) {
+                snprintf(out, cap, "%s", real);
+                return;
             }
-            /* Installed tree: <prefix>/bin/screenplus-tray -> ../share/icons */
-            w = snprintf(cand, sizeof cand, "%s/../share/icons", exe);
-            if (w > 0 && (size_t)w < sizeof cand) {
-                char real[PATH_MAX];
-                if (realpath(cand, real)) {
-                    char test_png[PATH_MAX + 64];
-                    snprintf(test_png, sizeof test_png, "%s/hicolor/256x256/apps/screenplus-tray.png", real);
-                    if (access(test_png, R_OK) == 0) {
-                        snprintf(out, cap, "%s", real);
-                        return;
-                    }
-                }
+
+            /* 2. Development fallback: <build>/screenplus-tray -> ../data/icons */
+            w = snprintf(cand, sizeof cand, "%s/../data/icons", exe);
+            if (w > 0 && (size_t)w < sizeof cand && realpath(cand, real) && has_tray_icon(real)) {
+                snprintf(out, cap, "%s", real);
+                return;
             }
         }
     }
-    if (SP_INSTALL_ICON_DIR[0] && access(SP_INSTALL_ICON_DIR, R_OK) == 0) {
-        snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
-        return;
-    }
-    snprintf(out, cap, "/mnt/PRODUCTION/GIT/ScreenPlusTray/data/icons");
+
+    snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
 }
 
 static void compute_icon_and_tooltip(const SpState *st,
@@ -129,11 +148,11 @@ static void compute_icon_and_tooltip(const SpState *st,
                                      char *title_out, size_t title_cap,
                                      char *body_out, size_t body_cap)
 {
-    (void)body_cap;
+    snprintf(title_out, title_cap, "Screen+");
+
     if (!st->running) {
         snprintf(icon_out, icon_cap, "screenplus-tray-stopped");
-        snprintf(title_out, title_cap, "Screen+ — Not running");
-        body_out[0] = '\0';
+        snprintf(body_out, body_cap, "Not running");
         return;
     }
 
@@ -145,11 +164,10 @@ static void compute_icon_and_tooltip(const SpState *st,
 
     const char *status_word = st->paused ? "Paused" : "Playing";
     if (st->has_current && st->current.name[0]) {
-        snprintf(title_out, title_cap, "%s — %s", st->current.name, status_word);
+        snprintf(body_out, body_cap, "%s — %s", st->current.name, status_word);
     } else {
-        snprintf(title_out, title_cap, "Screen+ — %s", status_word);
+        snprintf(body_out, body_cap, "%s", status_word);
     }
-    body_out[0] = '\0';
 }
 
 static void append_dict_string(DBusMessageIter *dict, const char *key, const char *val)
@@ -346,8 +364,7 @@ static DBusHandlerResult handle_get_all_props(DBusConnection *conn, DBusMessage 
 static void on_activate(void)
 {
     if (!g_sni.state || !g_sni.state->running) return;
-    const char *argv[] = { "show", NULL };
-    sp_client_command(argv, NULL, NULL);
+    sp_menu_toggle_window(g_sni.state);
 }
 
 static void on_secondary_activate(DBusConnection *conn)
@@ -360,6 +377,7 @@ static void on_secondary_activate(DBusConnection *conn)
         if (d) g_sni.state->paused = json_bool(json_get(d, "paused"), !g_sni.state->paused);
         json_free(root);
         sp_sni_sync(conn, g_sni.state, 0);
+        sp_dbusmenu_sync(conn, g_sni.state, 0);
     }
 }
 
@@ -373,18 +391,42 @@ static void on_scroll(dbus_int32_t delta, const char *orientation)
         if (!sp_client_ensure_volume(g_sni.state)) return;
     }
 
-    int step = (delta > 0) ? 5 : -5;
-    int nv = g_sni.state->volume + step;
+    /* Reset accumulator if scroll direction reversed */
+    if ((delta > 0 && g_sni.scroll_accum < 0) || (delta < 0 && g_sni.scroll_accum > 0)) {
+        g_sni.scroll_accum = 0;
+    }
+    g_sni.scroll_accum += delta;
+
+    int steps = g_sni.scroll_accum / 120;
+    if (steps == 0) return;
+    g_sni.scroll_accum %= 120;
+
+    int nv = g_sni.state->volume + steps * 5;
     if (nv < 0) nv = 0;
     if (nv > 100) nv = 100;
-    if (nv == g_sni.state->volume) return;
+    if (nv == g_sni.state->volume && !g_sni.scroll_pending) return;
+
+    g_sni.state->volume = nv;
+    g_sni.scroll_pending = 1;
+    g_sni.scroll_due_ms = monotonic_ms() + SCROLL_DEBOUNCE_MS;
+}
+
+int64_t sp_sni_tick_scroll(DBusConnection *conn, int64_t now_ms)
+{
+    if (!g_sni.scroll_pending) return 0;
+    if (now_ms < g_sni.scroll_due_ms) return g_sni.scroll_due_ms;
+
+    g_sni.scroll_pending = 0;
+    g_sni.scroll_due_ms = 0;
+    if (!g_sni.state || !g_sni.state->running) return 0;
 
     char num[16];
-    snprintf(num, sizeof num, "%d", nv);
+    snprintf(num, sizeof num, "%d", g_sni.state->volume);
     const char *argv[] = { "volume", num, NULL };
     if (sp_client_command(argv, NULL, NULL)) {
-        g_sni.state->volume = nv;
+        sp_dbusmenu_sync(conn, g_sni.state, 0);
     }
+    return 0;
 }
 
 static DBusHandlerResult sni_message_handler(DBusConnection *conn, DBusMessage *msg, void *user_data)
@@ -475,7 +517,6 @@ void sp_sni_register_watcher(DBusConnection *conn)
     if (!msg) return;
     const char *arg = g_sni.service_name;
     dbus_message_append_args(msg, DBUS_TYPE_STRING, &arg, DBUS_TYPE_INVALID);
-    /* Non-blocking send: we don't block if the watcher isn't up yet. */
     dbus_connection_send(conn, msg, NULL);
     dbus_message_unref(msg);
     dbus_connection_flush(conn);

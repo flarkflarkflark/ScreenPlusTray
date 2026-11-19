@@ -18,6 +18,7 @@ typedef struct SpWallpaper {
 typedef struct SpState {
     int  running;
     int  unresponsive;      /* 1 if last socket request timed out */
+    int  window_open;       /* Tracked locally by the tray (show -> 1, hide -> 0, reset on stop/restart) */
 
     /* From `status` */
     int  paused;

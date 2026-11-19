@@ -1,5 +1,6 @@
 /* Entry point, D-Bus event loop, and 2 s status polling for screenplus-tray. */
 #include "client.h"
+#include "dbusmenu.h"
 #include "sni.h"
 #include <dbus/dbus.h>
 #include <errno.h>
@@ -57,7 +58,14 @@ int main(int argc, char **argv)
     sp_state_init(&state);
     sp_client_poll_status(&state);
 
-    if (!sp_sni_init(conn, &state, "/NO_DBUSMENU")) {
+    int menu_quit = 0;
+    if (!sp_dbusmenu_init(conn, &state, &menu_quit)) {
+        dbus_connection_unref(conn);
+        return 1;
+    }
+
+    if (!sp_sni_init(conn, &state, DBUSMENU_OBJECT_PATH)) {
+        sp_dbusmenu_shutdown(conn);
         dbus_connection_unref(conn);
         return 1;
     }
@@ -67,12 +75,20 @@ int main(int argc, char **argv)
 
     int64_t next_poll = now_ms() + 2000;
 
-    while (!g_quit && dbus_connection_get_is_connected(conn)) {
+    while (!g_quit && !menu_quit && dbus_connection_get_is_connected(conn)) {
         while (dbus_connection_dispatch(conn) == DBUS_DISPATCH_DATA_REMAINS) {}
         dbus_connection_flush(conn);
+        if (g_quit || menu_quit) break;
 
         int64_t now = now_ms();
-        int timeout_ms = (int)(next_poll - now);
+        int64_t scroll_due = sp_sni_tick_scroll(conn, now);
+
+        int64_t wake_at = next_poll;
+        if (scroll_due > 0 && scroll_due < wake_at) {
+            wake_at = scroll_due;
+        }
+
+        int timeout_ms = (int)(wake_at - now);
         if (timeout_ms < 0) timeout_ms = 0;
         if (timeout_ms > 2000) timeout_ms = 2000;
 
@@ -90,14 +106,18 @@ int main(int argc, char **argv)
         while (dbus_connection_dispatch(conn) == DBUS_DISPATCH_DATA_REMAINS) {}
 
         now = now_ms();
+        sp_sni_tick_scroll(conn, now);
+
         if (now >= next_poll) {
             next_poll = now + 2000;
             sp_client_poll_status(&state);
             sp_sni_sync(conn, &state, 0);
+            sp_dbusmenu_sync(conn, &state, 0);
         }
     }
 
     sp_sni_shutdown(conn);
+    sp_dbusmenu_shutdown(conn);
     dbus_connection_flush(conn);
     dbus_connection_unref(conn);
     return 0;

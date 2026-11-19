@@ -385,6 +385,7 @@ static int poll_status_only(SpState *st, int *was_running_out, int *timed_out)
         if (not_running) {
             st->running = 0;
             st->unresponsive = 0;
+            st->window_open = 0;
             st->has_current = 0;
             memset(&st->current, 0, sizeof st->current);
             st->have_list = 0;
@@ -393,6 +394,9 @@ static int poll_status_only(SpState *st, int *was_running_out, int *timed_out)
         return 0;
     }
 
+    if (!was_running) {
+        st->window_open = 0;
+    }
     st->running = 1;
     st->unresponsive = 0;
     const JVal *d = json_get(root, "data");

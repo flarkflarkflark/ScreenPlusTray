@@ -3,6 +3,7 @@
 #pragma once
 #include "client.h"
 #include <dbus/dbus.h>
+#include <stdint.h>
 
 #define SNI_OBJECT_PATH   "/StatusNotifierItem"
 #define MENU_OBJECT_PATH  "/MenuBar"
@@ -17,6 +18,10 @@ void sp_sni_register_watcher(DBusConnection *conn);
 /* Sync IconName and ToolTip from `state`. Emits NewIcon / NewToolTip ONLY when changed.
  * If force_emit is 1, emits both signals unconditionally. */
 void sp_sni_sync(DBusConnection *conn, const SpState *state, int force_emit);
+
+/* Flush any debounced scroll-to-volume update when its 150 ms deadline arrives.
+ * Returns the next deadline in monotonic ms, or 0 if no volume update is pending. */
+int64_t sp_sni_tick_scroll(DBusConnection *conn, int64_t now_ms);
 
 /* Clean up StatusNotifierItem resources. */
 void sp_sni_shutdown(DBusConnection *conn);
