@@ -1,12 +1,19 @@
-# ScreenPlusTray (`screenplus-tray`)
+# ScreenPlusTray
 
-A lightweight, standalone Linux system tray icon (`org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`) for [Screen+](https://github.com/CoolNinja2009/ScreenPlus) on **KDE Plasma 6** and **Hyprland** (Waybar `tray` module).
+System tray icon for Screen+ on Linux.
 
-This is an unofficial companion tool. Not affiliated with or endorsed by the Screen+ project.
+ScreenPlusTray is a small, standalone tray icon for [Screen+](https://github.com/CoolNinja2009/ScreenPlus), the live wallpaper app, on **KDE Plasma 6** and **Hyprland** (Waybar `tray` module). Show or hide the window, pause, skip, switch wallpapers, change volume and slideshow settings straight from the tray, with on-screen feedback on KDE. It talks to the already-installed Screen+ service over its socket and does not modify Screen+ itself.
 
-`screenplus-tray` communicates directly with an already-installed Screen+ service over its Unix domain socket (`$XDG_RUNTIME_DIR/screenplus.sock`) without modifying Screen+ itself.
+[![Plasma 6](https://img.shields.io/badge/Plasma-6-7B2FBF)](https://kde.org/plasma-desktop/)
+[![Hyprland](https://img.shields.io/badge/Hyprland-Waybar-1E9BD7)](https://github.com/hyprwm/Hyprland)
+[![Release](https://img.shields.io/github/v/release/flarkflarkflark/ScreenPlusTray?color=4c1)](https://github.com/flarkflarkflark/ScreenPlusTray/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-4c1)](LICENSE)
 
-## Install
+> Unofficial companion tool. Not affiliated with or endorsed by the Screen+ project.
+
+## Get it
+
+### One-line install
 
 Install the prebuilt `x86_64` binary into `~/.local` (no compiler or `sudo` needed):
 
