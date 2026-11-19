@@ -11,7 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define SOCKET_TIMEOUT_MS 1500
+#define SOCKET_TIMEOUT_MS 500
 
 static void copy_str(char *dst, size_t cap, const char *src)
 {
@@ -32,7 +32,7 @@ int sp_socket_path(char *out, size_t cap)
     return n > 0 && (size_t)n < cap;
 }
 
-static int connect_nonblock(const char *path)
+static int connect_nonblock(const char *path, int *not_running, int *timed_out)
 {
     struct sockaddr_un a;
     memset(&a, 0, sizeof a);
@@ -40,23 +40,39 @@ static int connect_nonblock(const char *path)
     snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
 
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        if (not_running) *not_running = 1;
+        return -1;
+    }
 
     int rc = connect(fd, (struct sockaddr *)&a, sizeof a);
     if (rc < 0) {
-        if (errno == EINPROGRESS) {
+        if (errno == EINPROGRESS || errno == EAGAIN) {
             struct pollfd p = { fd, POLLOUT, 0 };
-            if (poll(&p, 1, SOCKET_TIMEOUT_MS) <= 0) {
+            int pr = poll(&p, 1, SOCKET_TIMEOUT_MS);
+            if (pr == 0) {
+                if (timed_out) *timed_out = 1;
+                close(fd);
+                return -1;
+            }
+            if (pr < 0) {
+                if (not_running) *not_running = 1;
                 close(fd);
                 return -1;
             }
             int err = 0;
             socklen_t len = sizeof err;
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                if (err == ETIMEDOUT) {
+                    if (timed_out) *timed_out = 1;
+                } else {
+                    if (not_running) *not_running = 1;
+                }
                 close(fd);
                 return -1;
             }
         } else {
+            if (not_running) *not_running = 1;
             close(fd);
             return -1;
         }
@@ -64,10 +80,11 @@ static int connect_nonblock(const char *path)
     return fd;
 }
 
-int sp_client_command(const char *const *argv, JVal **out_root, int *not_running)
+int sp_client_command_ex(const char *const *argv, JVal **out_root, int *not_running, int *timed_out)
 {
     if (out_root) *out_root = NULL;
     if (not_running) *not_running = 0;
+    if (timed_out) *timed_out = 0;
 
     char path[108];
     if (!sp_socket_path(path, sizeof path)) {
@@ -75,11 +92,8 @@ int sp_client_command(const char *const *argv, JVal **out_root, int *not_running
         return 0;
     }
 
-    int fd = connect_nonblock(path);
-    if (fd < 0) {
-        if (not_running) *not_running = 1;
-        return 0;
-    }
+    int fd = connect_nonblock(path, not_running, timed_out);
+    if (fd < 0) return 0;
 
     StrBuf q = { 0 };
     sb_puts(&q, "{\"argv\":[");
@@ -95,6 +109,7 @@ int sp_client_command(const char *const *argv, JVal **out_root, int *not_running
         int pr = poll(&p, 1, SOCKET_TIMEOUT_MS);
         if (pr <= 0) {
             if (pr < 0 && errno == EINTR) continue;
+            if (pr == 0 && timed_out) *timed_out = 1;
             sb_free(&q);
             close(fd);
             return 0;
@@ -125,7 +140,12 @@ int sp_client_command(const char *const *argv, JVal **out_root, int *not_running
             if (errno == EINTR) continue;
             break;
         }
-        if (pr == 0) break; /* timeout */
+        if (pr == 0) {
+            if (timed_out) *timed_out = 1;
+            sb_free(&in);
+            close(fd);
+            return 0;
+        }
         ssize_t n = read(fd, buf, sizeof buf);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
@@ -154,6 +174,11 @@ int sp_client_command(const char *const *argv, JVal **out_root, int *not_running
     if (out_root) *out_root = j;
     else json_free(j);
     return 1;
+}
+
+int sp_client_command(const char *const *argv, JVal **out_root, int *not_running)
+{
+    return sp_client_command_ex(argv, out_root, not_running, NULL);
 }
 
 int sp_client_exec_binary(const char *const *argv, int wait_for_exit)
@@ -198,11 +223,18 @@ static void parse_wallpaper_obj(const JVal *w, SpWallpaper *out, int on_screen)
     out->on_screen = on_screen;
 }
 
-static int fetch_settings_and_slideshow(SpState *st)
+static int fetch_settings_and_slideshow(SpState *st, int *timed_out)
 {
     JVal *root = NULL;
+    int to = 0;
     const char *argv_set[] = { "settings", NULL };
-    if (!sp_client_command(argv_set, &root, NULL)) return 0;
+    if (!sp_client_command_ex(argv_set, &root, NULL, &to)) {
+        if (to) {
+            st->unresponsive = 1;
+            if (timed_out) *timed_out = 1;
+        }
+        return 0;
+    }
     const JVal *d = json_get(root, "data");
     if (d && d->t == J_OBJ) {
         st->audio = json_bool(json_get(d, "audio"), st->audio);
@@ -222,26 +254,39 @@ static int fetch_settings_and_slideshow(SpState *st)
     json_free(root);
 
     root = NULL;
+    to = 0;
     const char *argv_ss[] = { "slideshow", NULL };
-    if (sp_client_command(argv_ss, &root, NULL)) {
-        d = json_get(root, "data");
-        if (d && d->t == J_OBJ) {
-            st->slideshow = json_bool(json_get(d, "slideshow"), st->slideshow);
-            st->slideshow_minutes = (int)json_num(json_get(d, "minutes"), st->slideshow_minutes);
-            st->shuffle = json_bool(json_get(d, "shuffle"), st->shuffle);
-            copy_str(st->slideshow_from, sizeof st->slideshow_from,
-                     json_str(json_get(d, "from"), ""));
+    if (!sp_client_command_ex(argv_ss, &root, NULL, &to)) {
+        if (to) {
+            st->unresponsive = 1;
+            if (timed_out) *timed_out = 1;
         }
-        json_free(root);
+        return 0;
     }
+    d = json_get(root, "data");
+    if (d && d->t == J_OBJ) {
+        st->slideshow = json_bool(json_get(d, "slideshow"), st->slideshow);
+        st->slideshow_minutes = (int)json_num(json_get(d, "minutes"), st->slideshow_minutes);
+        st->shuffle = json_bool(json_get(d, "shuffle"), st->shuffle);
+        copy_str(st->slideshow_from, sizeof st->slideshow_from,
+                 json_str(json_get(d, "from"), ""));
+    }
+    json_free(root);
     return 1;
 }
 
-int sp_client_fetch_list(SpState *st)
+static int fetch_list_ex(SpState *st, int *timed_out)
 {
     JVal *root = NULL;
+    int to = 0;
     const char *argv_ls[] = { "list", NULL };
-    if (!sp_client_command(argv_ls, &root, NULL)) return 0;
+    if (!sp_client_command_ex(argv_ls, &root, NULL, &to)) {
+        if (to) {
+            st->unresponsive = 1;
+            if (timed_out) *timed_out = 1;
+        }
+        return 0;
+    }
 
     const JVal *arr = json_get(root, "data");
     if (arr && arr->t == J_ARR) {
@@ -260,7 +305,6 @@ int sp_client_fetch_list(SpState *st)
             SpWallpaper parsed;
             parse_wallpaper_obj(w, &parsed, on_scr);
 
-            /* Fallback if status had no displays */
             if (!st->has_current && on_scr && parsed.id[0]) {
                 st->current = parsed;
                 st->has_current = 1;
@@ -288,11 +332,23 @@ int sp_client_fetch_list(SpState *st)
     return 1;
 }
 
-static int fetch_collections(SpState *st)
+int sp_client_fetch_list(SpState *st)
+{
+    return fetch_list_ex(st, NULL);
+}
+
+static int fetch_collections(SpState *st, int *timed_out)
 {
     JVal *root = NULL;
+    int to = 0;
     const char *argv_col[] = { "collection", "list", NULL };
-    if (!sp_client_command(argv_col, &root, NULL)) return 0;
+    if (!sp_client_command_ex(argv_col, &root, NULL, &to)) {
+        if (to) {
+            st->unresponsive = 1;
+            if (timed_out) *timed_out = 1;
+        }
+        return 0;
+    }
 
     const JVal *arr = json_get(root, "data");
     if (arr && arr->t == J_ARR) {
@@ -309,16 +365,26 @@ static int fetch_collections(SpState *st)
     return 1;
 }
 
-int sp_client_poll_status(SpState *st)
+static int poll_status_only(SpState *st, int *was_running_out, int *timed_out)
 {
     int was_running = st->running;
+    if (was_running_out) *was_running_out = was_running;
+
     int not_running = 0;
+    int to = 0;
     JVal *root = NULL;
     const char *argv_st[] = { "status", NULL };
 
-    if (!sp_client_command(argv_st, &root, &not_running)) {
+    if (!sp_client_command_ex(argv_st, &root, &not_running, &to)) {
+        if (to) {
+            /* Service timed out: mark unresponsive and keep cached state. */
+            st->unresponsive = 1;
+            if (timed_out) *timed_out = 1;
+            return 0;
+        }
         if (not_running) {
             st->running = 0;
+            st->unresponsive = 0;
             st->has_current = 0;
             memset(&st->current, 0, sizeof st->current);
             st->have_list = 0;
@@ -328,6 +394,7 @@ int sp_client_poll_status(SpState *st)
     }
 
     st->running = 1;
+    st->unresponsive = 0;
     const JVal *d = json_get(root, "data");
     if (d && d->t == J_OBJ) {
         st->paused = json_bool(json_get(d, "paused"), 0);
@@ -356,28 +423,61 @@ int sp_client_poll_status(SpState *st)
         }
     }
     json_free(root);
+    return 1;
+}
 
-    /* Whenever the service newly appears (or at startup), fetch list and initial settings once. */
+int sp_client_poll_status(SpState *st)
+{
+    int was_running = 0;
+    int to = 0;
+    if (!poll_status_only(st, &was_running, &to)) return 0;
+
+    /* Whenever the service newly appears (or at startup), fetch list and initial settings once.
+     * Stop immediately after the first timeout. */
     if (!was_running || !st->have_list || !st->have_settings) {
-        fetch_settings_and_slideshow(st);
-        sp_client_fetch_list(st);
-        fetch_collections(st);
+        if (!fetch_settings_and_slideshow(st, &to) && to) return 0;
+        if (!fetch_list_ex(st, &to) && to) return 0;
+        if (!fetch_collections(st, &to) && to) return 0;
     }
     return 1;
 }
 
 int sp_client_fetch_full(SpState *st)
 {
-    if (!sp_client_poll_status(st)) return 0;
-    fetch_settings_and_slideshow(st);
-    sp_client_fetch_list(st);
-    fetch_collections(st);
+    int to = 0;
+    if (!poll_status_only(st, NULL, &to)) return 0;
+    if (!fetch_settings_and_slideshow(st, &to) && to) return 0;
+    if (!fetch_list_ex(st, &to) && to) return 0;
+    if (!fetch_collections(st, &to) && to) return 0;
+    return 1;
+}
+
+int sp_client_ensure_volume(SpState *st)
+{
+    if (st->have_settings) return 1;
+    JVal *root = NULL;
+    int to = 0;
+    const char *argv[] = { "volume", NULL };
+    if (!sp_client_command_ex(argv, &root, NULL, &to)) {
+        if (to) st->unresponsive = 1;
+        return 0;
+    }
+    const JVal *d = json_get(root, "data");
+    if (d && d->t == J_OBJ) {
+        st->volume = (int)json_num(json_get(d, "volume"), st->volume);
+        if (st->volume < 0) st->volume = 0;
+        if (st->volume > 100) st->volume = 100;
+        st->audio = json_bool(json_get(d, "audio"), st->audio);
+        st->have_settings = 1;
+    }
+    json_free(root);
     return 1;
 }
 
 void sp_state_dump(const SpState *st)
 {
     printf("running: %s\n", st->running ? "true" : "false");
+    if (st->unresponsive) printf("unresponsive: true\n");
     if (!st->running) return;
 
     printf("state: %s\n", st->state_text);

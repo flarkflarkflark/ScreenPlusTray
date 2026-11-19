@@ -17,6 +17,7 @@ typedef struct SpWallpaper {
 
 typedef struct SpState {
     int  running;
+    int  unresponsive;      /* 1 if last socket request timed out */
 
     /* From `status` */
     int  paused;
@@ -50,11 +51,13 @@ typedef struct SpState {
 /* Resolve the socket path ($XDG_RUNTIME_DIR/screenplus.sock or /tmp/screenplus.sock-<uid>). */
 int sp_socket_path(char *out, size_t cap);
 
-/* Send a command argv (NULL-terminated) over the Unix socket with short timeouts.
+/* Send a command argv (NULL-terminated) over the Unix socket with short (~500 ms) timeouts.
  * Returns 1 if the socket call succeeded and ok:true, 0 otherwise.
- * If not_running != NULL, sets *not_running = 1 when connect() fails.
+ * If not_running != NULL, sets *not_running = 1 when connect() fails immediately (ENOENT/ECONNREFUSED).
+ * If timed_out != NULL, sets *timed_out = 1 when connect/write/read times out.
  * If out_root != NULL and ok:true, stores the parsed root JVal* (caller frees with json_free).
  * Logs error text to stderr when the service replies with ok:false. */
+int sp_client_command_ex(const char *const *argv, JVal **out_root, int *not_running, int *timed_out);
 int sp_client_command(const char *const *argv, JVal **out_root, int *not_running);
 
 /* Run `screenplus <args...>` via fork/execvp (for local CLI commands like `start`). */
@@ -64,14 +67,19 @@ int sp_client_exec_binary(const char *const *argv, int wait_for_exit);
 void sp_state_init(SpState *st);
 
 /* Poll `status` only (quiet in service logs). If the service newly appeared, also fetches
- * `list` and `settings` once so initial volume and library count are known. */
+ * `list` and `settings` once so initial volume and library count are known.
+ * Stops after the first timeout and keeps cached state if unresponsive. */
 int sp_client_poll_status(SpState *st);
 
-/* Fetch `settings`, `slideshow`, `list`, and `collection list` (for AboutToShow / post-action). */
+/* Fetch `settings`, `slideshow`, `list`, and `collection list` (for AboutToShow / post-action).
+ * Stops after the first timeout, marks service as unresponsive, and retains cached state. */
 int sp_client_fetch_full(SpState *st);
 
 /* Fetch `list` only (startup / service reappear). */
 int sp_client_fetch_list(SpState *st);
+
+/* Fetch `volume` once into st->volume if not yet cached. */
+int sp_client_ensure_volume(SpState *st);
 
 /* Print the parsed state to stdout (--dump). */
 void sp_state_dump(const SpState *st);

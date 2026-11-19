@@ -1,0 +1,562 @@
+/* org.kde.StatusNotifierItem D-Bus implementation.
+ * Adapted from SDL3 (src/tray/unix/SDL_dbustray.c), zlib License. */
+#include "sni.h"
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+
+#define SNI_INTERFACE         "org.kde.StatusNotifierItem"
+#define SNI_WATCHER_SERVICE   "org.kde.StatusNotifierWatcher"
+#define SNI_WATCHER_PATH      "/StatusNotifierWatcher"
+#define SNI_WATCHER_INTERFACE "org.kde.StatusNotifierWatcher"
+
+#ifndef SP_INSTALL_ICON_DIR
+#define SP_INSTALL_ICON_DIR ""
+#endif
+
+static const char *k_sni_introspect =
+    "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" "
+    "\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n"
+    "<node>\n"
+    "  <interface name=\"org.kde.StatusNotifierItem\">\n"
+    "    <property name=\"Category\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"Id\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"Title\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"Status\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"WindowId\" type=\"i\" access=\"read\"/>\n"
+    "    <property name=\"IconThemePath\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"Menu\" type=\"o\" access=\"read\"/>\n"
+    "    <property name=\"ItemIsMenu\" type=\"b\" access=\"read\"/>\n"
+    "    <property name=\"IconName\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"IconPixmap\" type=\"a(iiay)\" access=\"read\"/>\n"
+    "    <property name=\"OverlayIconName\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"OverlayIconPixmap\" type=\"a(iiay)\" access=\"read\"/>\n"
+    "    <property name=\"AttentionIconName\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"AttentionIconPixmap\" type=\"a(iiay)\" access=\"read\"/>\n"
+    "    <property name=\"AttentionMovieName\" type=\"s\" access=\"read\"/>\n"
+    "    <property name=\"ToolTip\" type=\"(sa(iiay)ss)\" access=\"read\"/>\n"
+    "    <method name=\"ProvideXdgActivationToken\">\n"
+    "      <arg name=\"token\" type=\"s\" direction=\"in\"/>\n"
+    "    </method>\n"
+    "    <method name=\"ContextMenu\">\n"
+    "      <arg name=\"x\" type=\"i\" direction=\"in\"/>\n"
+    "      <arg name=\"y\" type=\"i\" direction=\"in\"/>\n"
+    "    </method>\n"
+    "    <method name=\"Activate\">\n"
+    "      <arg name=\"x\" type=\"i\" direction=\"in\"/>\n"
+    "      <arg name=\"y\" type=\"i\" direction=\"in\"/>\n"
+    "    </method>\n"
+    "    <method name=\"SecondaryActivate\">\n"
+    "      <arg name=\"x\" type=\"i\" direction=\"in\"/>\n"
+    "      <arg name=\"y\" type=\"i\" direction=\"in\"/>\n"
+    "    </method>\n"
+    "    <method name=\"Scroll\">\n"
+    "      <arg name=\"delta\" type=\"i\" direction=\"in\"/>\n"
+    "      <arg name=\"orientation\" type=\"s\" direction=\"in\"/>\n"
+    "    </method>\n"
+    "    <signal name=\"NewTitle\"/>\n"
+    "    <signal name=\"NewIcon\"/>\n"
+    "    <signal name=\"NewAttentionIcon\"/>\n"
+    "    <signal name=\"NewOverlayIcon\"/>\n"
+    "    <signal name=\"NewMenu\"/>\n"
+    "    <signal name=\"NewToolTip\"/>\n"
+    "    <signal name=\"NewStatus\">\n"
+    "      <arg name=\"status\" type=\"s\"/>\n"
+    "    </signal>\n"
+    "  </interface>\n"
+    "</node>\n";
+
+static struct {
+    SpState    *state;
+    char        service_name[128];
+    char        icon_theme_path[PATH_MAX];
+    char        icon_name[64];
+    char        tooltip_title[192];
+    char        tooltip_body[128];
+    const char *menu_path;
+} g_sni;
+
+static void resolve_icon_theme_path(char *out, size_t cap)
+{
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            /* Build tree: <build>/screenplus-tray -> ../data/icons */
+            char cand[PATH_MAX];
+            int w = snprintf(cand, sizeof cand, "%s/../data/icons", exe);
+            if (w > 0 && (size_t)w < sizeof cand) {
+                char real[PATH_MAX];
+                if (realpath(cand, real)) {
+                    char test_png[PATH_MAX + 64];
+                    snprintf(test_png, sizeof test_png, "%s/screenplus-tray.png", real);
+                    if (access(test_png, R_OK) == 0) {
+                        snprintf(out, cap, "%s", real);
+                        return;
+                    }
+                }
+            }
+            /* Installed tree: <prefix>/bin/screenplus-tray -> ../share/icons */
+            w = snprintf(cand, sizeof cand, "%s/../share/icons", exe);
+            if (w > 0 && (size_t)w < sizeof cand) {
+                char real[PATH_MAX];
+                if (realpath(cand, real)) {
+                    char test_png[PATH_MAX + 64];
+                    snprintf(test_png, sizeof test_png, "%s/hicolor/256x256/apps/screenplus-tray.png", real);
+                    if (access(test_png, R_OK) == 0) {
+                        snprintf(out, cap, "%s", real);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if (SP_INSTALL_ICON_DIR[0] && access(SP_INSTALL_ICON_DIR, R_OK) == 0) {
+        snprintf(out, cap, "%s", SP_INSTALL_ICON_DIR);
+        return;
+    }
+    snprintf(out, cap, "/mnt/PRODUCTION/GIT/ScreenPlusTray/data/icons");
+}
+
+static void compute_icon_and_tooltip(const SpState *st,
+                                     char *icon_out, size_t icon_cap,
+                                     char *title_out, size_t title_cap,
+                                     char *body_out, size_t body_cap)
+{
+    (void)body_cap;
+    if (!st->running) {
+        snprintf(icon_out, icon_cap, "screenplus-tray-stopped");
+        snprintf(title_out, title_cap, "Screen+ — Not running");
+        body_out[0] = '\0';
+        return;
+    }
+
+    if (st->paused) {
+        snprintf(icon_out, icon_cap, "screenplus-tray-paused");
+    } else {
+        snprintf(icon_out, icon_cap, "screenplus-tray");
+    }
+
+    const char *status_word = st->paused ? "Paused" : "Playing";
+    if (st->has_current && st->current.name[0]) {
+        snprintf(title_out, title_cap, "%s — %s", st->current.name, status_word);
+    } else {
+        snprintf(title_out, title_cap, "Screen+ — %s", status_word);
+    }
+    body_out[0] = '\0';
+}
+
+static void append_dict_string(DBusMessageIter *dict, const char *key, const char *val)
+{
+    DBusMessageIter entry, variant;
+    dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(dict, &entry);
+}
+
+static void append_dict_objpath(DBusMessageIter *dict, const char *key, const char *val)
+{
+    DBusMessageIter entry, variant;
+    dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "o", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_OBJECT_PATH, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(dict, &entry);
+}
+
+static void append_dict_bool(DBusMessageIter *dict, const char *key, dbus_bool_t val)
+{
+    DBusMessageIter entry, variant;
+    dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(dict, &entry);
+}
+
+static void append_dict_int32(DBusMessageIter *dict, const char *key, dbus_int32_t val)
+{
+    DBusMessageIter entry, variant;
+    dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "i", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_INT32, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(dict, &entry);
+}
+
+static void append_empty_pixmap_variant(DBusMessageIter *parent)
+{
+    DBusMessageIter variant, array;
+    dbus_message_iter_open_container(parent, DBUS_TYPE_VARIANT, "a(iiay)", &variant);
+    dbus_message_iter_open_container(&variant, DBUS_TYPE_ARRAY, "(iiay)", &array);
+    dbus_message_iter_close_container(&variant, &array);
+    dbus_message_iter_close_container(parent, &variant);
+}
+
+static void append_tooltip_variant(DBusMessageIter *parent)
+{
+    DBusMessageIter variant, st, array;
+    const char *icon = g_sni.icon_name;
+    const char *title = g_sni.tooltip_title;
+    const char *body = g_sni.tooltip_body;
+    dbus_message_iter_open_container(parent, DBUS_TYPE_VARIANT, "(sa(iiay)ss)", &variant);
+    dbus_message_iter_open_container(&variant, DBUS_TYPE_STRUCT, NULL, &st);
+    dbus_message_iter_append_basic(&st, DBUS_TYPE_STRING, &icon);
+    dbus_message_iter_open_container(&st, DBUS_TYPE_ARRAY, "(iiay)", &array);
+    dbus_message_iter_close_container(&st, &array);
+    dbus_message_iter_append_basic(&st, DBUS_TYPE_STRING, &title);
+    dbus_message_iter_append_basic(&st, DBUS_TYPE_STRING, &body);
+    dbus_message_iter_close_container(&variant, &st);
+    dbus_message_iter_close_container(parent, &variant);
+}
+
+static DBusHandlerResult handle_get_prop(DBusConnection *conn, DBusMessage *msg)
+{
+    DBusMessageIter args, iter, variant;
+    const char *iface = NULL, *prop = NULL;
+
+    if (!dbus_message_iter_init(msg, &args)) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    if (dbus_message_iter_get_arg_type(&args) != DBUS_TYPE_STRING) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    dbus_message_iter_get_basic(&args, &iface);
+    if (!dbus_message_iter_next(&args)) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    if (dbus_message_iter_get_arg_type(&args) != DBUS_TYPE_STRING) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    dbus_message_iter_get_basic(&args, &prop);
+
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (!reply) return DBUS_HANDLER_RESULT_NEED_MEMORY;
+    dbus_message_iter_init_append(reply, &iter);
+
+    const char *val = "";
+    if (!strcmp(prop, "Category")) {
+        val = "ApplicationStatus";
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "Id")) {
+        val = "screenplus-tray";
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "Title")) {
+        val = "Screen+";
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "Status")) {
+        val = "Active";
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "IconName")) {
+        val = g_sni.icon_name;
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "IconThemePath")) {
+        val = g_sni.icon_theme_path;
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "OverlayIconName") || !strcmp(prop, "AttentionIconName") || !strcmp(prop, "AttentionMovieName")) {
+        val = "";
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "IconPixmap") || !strcmp(prop, "OverlayIconPixmap") || !strcmp(prop, "AttentionIconPixmap")) {
+        append_empty_pixmap_variant(&iter);
+    } else if (!strcmp(prop, "WindowId")) {
+        dbus_int32_t wid = 0;
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "i", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_INT32, &wid);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "ItemIsMenu")) {
+        dbus_bool_t b = FALSE; /* FALSE so left-click triggers Activate */
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "b", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &b);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "Menu")) {
+        val = g_sni.menu_path ? g_sni.menu_path : "/NO_DBUSMENU";
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "o", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_OBJECT_PATH, &val);
+        dbus_message_iter_close_container(&iter, &variant);
+    } else if (!strcmp(prop, "ToolTip")) {
+        append_tooltip_variant(&iter);
+    } else {
+        dbus_message_unref(reply);
+        reply = dbus_message_new_error(msg, DBUS_ERROR_UNKNOWN_PROPERTY, "Unknown property");
+    }
+
+    dbus_connection_send(conn, reply, NULL);
+    dbus_message_unref(reply);
+    return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult handle_get_all_props(DBusConnection *conn, DBusMessage *msg)
+{
+    DBusMessageIter iter, dict, entry;
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (!reply) return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+    dbus_message_iter_init_append(reply, &iter);
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict);
+
+    append_dict_string(&dict, "Category", "ApplicationStatus");
+    append_dict_string(&dict, "Id", "screenplus-tray");
+    append_dict_string(&dict, "Title", "Screen+");
+    append_dict_string(&dict, "Status", "Active");
+    append_dict_int32(&dict, "WindowId", 0);
+    append_dict_string(&dict, "IconThemePath", g_sni.icon_theme_path);
+    append_dict_string(&dict, "IconName", g_sni.icon_name);
+    append_dict_string(&dict, "OverlayIconName", "");
+    append_dict_string(&dict, "AttentionIconName", "");
+    append_dict_string(&dict, "AttentionMovieName", "");
+    append_dict_bool(&dict, "ItemIsMenu", FALSE);
+    append_dict_objpath(&dict, "Menu", g_sni.menu_path ? g_sni.menu_path : "/NO_DBUSMENU");
+
+    const char *k_pix = "IconPixmap";
+    dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &k_pix);
+    append_empty_pixmap_variant(&entry);
+    dbus_message_iter_close_container(&dict, &entry);
+
+    const char *k_tt = "ToolTip";
+    dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &k_tt);
+    append_tooltip_variant(&entry);
+    dbus_message_iter_close_container(&dict, &entry);
+
+    dbus_message_iter_close_container(&iter, &dict);
+    dbus_connection_send(conn, reply, NULL);
+    dbus_message_unref(reply);
+    return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static void on_activate(void)
+{
+    if (!g_sni.state || !g_sni.state->running) return;
+    const char *argv[] = { "show", NULL };
+    sp_client_command(argv, NULL, NULL);
+}
+
+static void on_secondary_activate(DBusConnection *conn)
+{
+    if (!g_sni.state || !g_sni.state->running) return;
+    const char *argv[] = { "toggle", NULL };
+    JVal *root = NULL;
+    if (sp_client_command(argv, &root, NULL)) {
+        const JVal *d = json_get(root, "data");
+        if (d) g_sni.state->paused = json_bool(json_get(d, "paused"), !g_sni.state->paused);
+        json_free(root);
+        sp_sni_sync(conn, g_sni.state, 0);
+    }
+}
+
+static void on_scroll(dbus_int32_t delta, const char *orientation)
+{
+    if (!g_sni.state || !g_sni.state->running || delta == 0) return;
+    if (orientation && orientation[0] && strcasecmp(orientation, "vertical") != 0) return;
+
+    /* Ensure initial volume was fetched at least once, then update locally without re-querying. */
+    if (!g_sni.state->have_settings) {
+        if (!sp_client_ensure_volume(g_sni.state)) return;
+    }
+
+    int step = (delta > 0) ? 5 : -5;
+    int nv = g_sni.state->volume + step;
+    if (nv < 0) nv = 0;
+    if (nv > 100) nv = 100;
+    if (nv == g_sni.state->volume) return;
+
+    char num[16];
+    snprintf(num, sizeof num, "%d", nv);
+    const char *argv[] = { "volume", num, NULL };
+    if (sp_client_command(argv, NULL, NULL)) {
+        g_sni.state->volume = nv;
+    }
+}
+
+static DBusHandlerResult sni_message_handler(DBusConnection *conn, DBusMessage *msg, void *user_data)
+{
+    (void)user_data;
+
+    if (dbus_message_is_method_call(msg, "org.freedesktop.DBus.Properties", "Get")) {
+        return handle_get_prop(conn, msg);
+    }
+    if (dbus_message_is_method_call(msg, "org.freedesktop.DBus.Properties", "GetAll")) {
+        return handle_get_all_props(conn, msg);
+    }
+    if (dbus_message_is_method_call(msg, "org.freedesktop.DBus.Introspectable", "Introspect")) {
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        if (!reply) return DBUS_HANDLER_RESULT_NEED_MEMORY;
+        dbus_message_append_args(reply, DBUS_TYPE_STRING, &k_sni_introspect, DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
+    if (dbus_message_is_method_call(msg, SNI_INTERFACE, "Activate")) {
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        if (reply) {
+            dbus_connection_send(conn, reply, NULL);
+            dbus_message_unref(reply);
+        }
+        on_activate();
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
+    if (dbus_message_is_method_call(msg, SNI_INTERFACE, "SecondaryActivate")) {
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        if (reply) {
+            dbus_connection_send(conn, reply, NULL);
+            dbus_message_unref(reply);
+        }
+        on_secondary_activate(conn);
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
+    if (dbus_message_is_method_call(msg, SNI_INTERFACE, "ContextMenu") ||
+        dbus_message_is_method_call(msg, SNI_INTERFACE, "ProvideXdgActivationToken")) {
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        if (reply) {
+            dbus_connection_send(conn, reply, NULL);
+            dbus_message_unref(reply);
+        }
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
+    if (dbus_message_is_method_call(msg, SNI_INTERFACE, "Scroll")) {
+        DBusError err;
+        dbus_error_init(&err);
+        dbus_int32_t delta = 0;
+        const char *orientation = "vertical";
+        dbus_message_get_args(msg, &err,
+                              DBUS_TYPE_INT32, &delta,
+                              DBUS_TYPE_STRING, &orientation,
+                              DBUS_TYPE_INVALID);
+        int ok = !dbus_error_is_set(&err);
+        dbus_error_free(&err);
+
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        if (reply) {
+            dbus_connection_send(conn, reply, NULL);
+            dbus_message_unref(reply);
+        }
+        if (ok) on_scroll(delta, orientation);
+        return DBUS_HANDLER_RESULT_HANDLED;
+    }
+
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+static void emit_sni_signal(DBusConnection *conn, const char *name)
+{
+    DBusMessage *sig = dbus_message_new_signal(SNI_OBJECT_PATH, SNI_INTERFACE, name);
+    if (!sig) return;
+    dbus_connection_send(conn, sig, NULL);
+    dbus_message_unref(sig);
+    dbus_connection_flush(conn);
+}
+
+void sp_sni_register_watcher(DBusConnection *conn)
+{
+    if (!conn || !g_sni.service_name[0]) return;
+    DBusMessage *msg = dbus_message_new_method_call(SNI_WATCHER_SERVICE,
+                                                    SNI_WATCHER_PATH,
+                                                    SNI_WATCHER_INTERFACE,
+                                                    "RegisterStatusNotifierItem");
+    if (!msg) return;
+    const char *arg = g_sni.service_name;
+    dbus_message_append_args(msg, DBUS_TYPE_STRING, &arg, DBUS_TYPE_INVALID);
+    /* Non-blocking send: we don't block if the watcher isn't up yet. */
+    dbus_connection_send(conn, msg, NULL);
+    dbus_message_unref(msg);
+    dbus_connection_flush(conn);
+}
+
+void sp_sni_sync(DBusConnection *conn, const SpState *state, int force_emit)
+{
+    char new_icon[64];
+    char new_title[192];
+    char new_body[128];
+
+    compute_icon_and_tooltip(state,
+                             new_icon, sizeof new_icon,
+                             new_title, sizeof new_title,
+                             new_body, sizeof new_body);
+
+    int icon_changed = strcmp(new_icon, g_sni.icon_name) != 0;
+    int tip_changed = strcmp(new_title, g_sni.tooltip_title) != 0 ||
+                      strcmp(new_body, g_sni.tooltip_body) != 0;
+
+    if (icon_changed) {
+        snprintf(g_sni.icon_name, sizeof g_sni.icon_name, "%s", new_icon);
+    }
+    if (tip_changed) {
+        snprintf(g_sni.tooltip_title, sizeof g_sni.tooltip_title, "%s", new_title);
+        snprintf(g_sni.tooltip_body, sizeof g_sni.tooltip_body, "%s", new_body);
+    }
+
+    if (conn) {
+        if (icon_changed || force_emit) emit_sni_signal(conn, "NewIcon");
+        if (tip_changed || force_emit)  emit_sni_signal(conn, "NewToolTip");
+    }
+}
+
+int sp_sni_init(DBusConnection *conn, SpState *state, const char *menu_path)
+{
+    memset(&g_sni, 0, sizeof g_sni);
+    g_sni.state = state;
+    g_sni.menu_path = menu_path;
+    resolve_icon_theme_path(g_sni.icon_theme_path, sizeof g_sni.icon_theme_path);
+    compute_icon_and_tooltip(state,
+                             g_sni.icon_name, sizeof g_sni.icon_name,
+                             g_sni.tooltip_title, sizeof g_sni.tooltip_title,
+                             g_sni.tooltip_body, sizeof g_sni.tooltip_body);
+
+    snprintf(g_sni.service_name, sizeof g_sni.service_name,
+             "org.kde.StatusNotifierItem-%d-1", (int)getpid());
+
+    DBusError err;
+    dbus_error_init(&err);
+    int ret = dbus_bus_request_name(conn, g_sni.service_name, DBUS_NAME_FLAG_REPLACE_EXISTING, &err);
+    if (dbus_error_is_set(&err) || ret != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
+        fprintf(stderr, "screenplus-tray: failed to request SNI bus name: %s\n",
+                dbus_error_is_set(&err) ? err.message : "not primary owner");
+        dbus_error_free(&err);
+        return 0;
+    }
+
+    DBusObjectPathVTable vtable;
+    memset(&vtable, 0, sizeof vtable);
+    vtable.message_function = sni_message_handler;
+
+    if (!dbus_connection_try_register_object_path(conn, SNI_OBJECT_PATH, &vtable, NULL, &err)) {
+        fprintf(stderr, "screenplus-tray: failed to register %s: %s\n",
+                SNI_OBJECT_PATH, dbus_error_is_set(&err) ? err.message : "unknown error");
+        dbus_error_free(&err);
+        return 0;
+    }
+
+    sp_sni_register_watcher(conn);
+    return 1;
+}
+
+void sp_sni_shutdown(DBusConnection *conn)
+{
+    if (!conn) return;
+    dbus_connection_unregister_object_path(conn, SNI_OBJECT_PATH);
+    if (g_sni.service_name[0]) {
+        DBusError err;
+        dbus_error_init(&err);
+        dbus_bus_release_name(conn, g_sni.service_name, &err);
+        dbus_error_free(&err);
+    }
+}

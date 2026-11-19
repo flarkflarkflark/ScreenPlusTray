@@ -15,12 +15,14 @@ pkg_check_modules(DBUS REQUIRED IMPORTED_TARGET dbus-1)
 add_executable(screenplus-tray
     src/main.c
     src/client.c
+    src/sni.c
     src/json.c
 )
 
 target_compile_definitions(screenplus-tray PRIVATE
     _POSIX_C_SOURCE=200809L
     _DEFAULT_SOURCE
+    SP_INSTALL_ICON_DIR="${CMAKE_INSTALL_PREFIX}/share/icons"
 )
 
 target_compile_options(screenplus-tray PRIVATE
