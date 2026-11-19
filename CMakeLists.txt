@@ -37,3 +37,22 @@ target_link_libraries(screenplus-tray PRIVATE
     PkgConfig::DBUS
     m
 )
+
+install(TARGETS screenplus-tray
+    RUNTIME DESTINATION bin
+)
+
+install(FILES data/screenplus-tray.desktop
+    DESTINATION share/applications
+)
+
+install(DIRECTORY data/icons/
+    DESTINATION share/screenplus-tray/icons
+)
+
+install(FILES
+    data/icons/screenplus-tray.png
+    data/icons/screenplus-tray-paused.png
+    data/icons/screenplus-tray-stopped.png
+    DESTINATION share/icons/hicolor/256x256/apps
+)

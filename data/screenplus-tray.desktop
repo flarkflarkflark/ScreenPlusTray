@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Screen+ Tray
+Comment=System tray icon for Screen+ live wallpaper service
+Exec=screenplus-tray
+Icon=screenplus-tray
+Terminal=false
+Categories=Utility;DesktopSettings;
+StartupNotify=false
+X-KDE-autostart-phase=2
