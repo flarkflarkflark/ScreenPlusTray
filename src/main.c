@@ -20,6 +20,12 @@
 #define WATCHER_MATCH_RULE \
     "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus'," \
     "member='NameOwnerChanged',arg0='org.kde.StatusNotifierWatcher'"
+#define PLASMA_MATCH_RULE \
+    "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus'," \
+    "member='NameOwnerChanged',arg0='org.kde.plasmashell'"
+#define NOTIFY_MATCH_RULE \
+    "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus'," \
+    "member='NameOwnerChanged',arg0='org.freedesktop.Notifications'"
 
 static volatile sig_atomic_t g_quit = 0;
 
@@ -51,6 +57,8 @@ static DBusHandlerResult watcher_filter(DBusConnection *conn, DBusMessage *msg, 
             if (name && !strcmp(name, "org.kde.StatusNotifierWatcher") &&
                 new_owner && new_owner[0] != '\0') {
                 sp_sni_register_watcher(conn);
+            } else if (name) {
+                sp_sni_on_name_owner_changed(name, new_owner);
             }
         }
         dbus_error_free(&err);
@@ -215,8 +223,12 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* Watch for org.kde.StatusNotifierWatcher (re)appearing (e.g. Waybar starting after the tray). */
+    /* Watch for org.kde.StatusNotifierWatcher and OSD services (re)appearing. */
     dbus_bus_add_match(conn, WATCHER_MATCH_RULE, &err);
+    dbus_error_free(&err);
+    dbus_bus_add_match(conn, PLASMA_MATCH_RULE, &err);
+    dbus_error_free(&err);
+    dbus_bus_add_match(conn, NOTIFY_MATCH_RULE, &err);
     dbus_error_free(&err);
     dbus_connection_add_filter(conn, watcher_filter, NULL, NULL);
 

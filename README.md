@@ -7,12 +7,13 @@ A lightweight, standalone Linux system tray icon (`org.kde.StatusNotifierItem` +
 ## Features
 
 - **Zero heavy dependencies**: pure C17 using only `libc` and `libdbus-1` (no GTK, Qt, SDL, libappindicator, or libpng).
-- **Tray icon & live state**:
+- **Tray icon, rich tooltip & OSD feedback**:
   - Active, paused, and stopped (greyed-out) icon variants.
-  - Tooltip displays the current wallpaper name and playback status (`Playing` / `Paused` / `Not running`).
+  - Tooltip displays the current wallpaper name, playback status (`Playing` / `Paused` / `Not running`), current volume percentage, and a quick reference of mouse interactions.
   - **Left click**: toggles the Screen+ window (`show` / `hide`).
-  - **Middle click**: pauses or resumes wallpapers (`toggle`).
-  - **Mouse wheel / touchpad scroll**: adjusts wallpaper volume in $\pm 5\%$ steps per 120 scroll units, clamped to `0..100%` and debounced (150 ms).
+  - **Middle click**: pauses or resumes wallpapers (`toggle`) and shows an on-screen display (OSD) indicator.
+  - **Mouse wheel / touchpad scroll**: adjusts wallpaper volume in $\pm 5\%$ steps per 120 scroll units (clamped to `0..100%`), updates the tooltip and volume OSD immediately on every step, and debounces the `volume N` command to the service (150 ms).
+  - **On-Screen Display (OSD)**: uses KDE Plasma's native `org.kde.osdService` (`mediaPlayerVolumeChanged` and `showText`) when `org.kde.plasmashell` is running, and falls back to `org.freedesktop.Notifications` (with synchronous replacement and progress gauge hint for `mako`, `dunst`, or `swaync` on Hyprland).
 - **Full context menu**:
   - Open/hide the Screen+ window.
   - Pause/resume wallpapers, skip to next wallpaper, or switch directly among up to 20 library wallpapers (plus the active wallpaper if outside the top 20).

@@ -16,6 +16,14 @@
 #define SNI_WATCHER_PATH      "/StatusNotifierWatcher"
 #define SNI_WATCHER_INTERFACE "org.kde.StatusNotifierWatcher"
 
+#define PLASMASHELL_SERVICE   "org.kde.plasmashell"
+#define KDE_OSD_PATH          "/org/kde/osdService"
+#define KDE_OSD_INTERFACE     "org.kde.osdService"
+
+#define NOTIFY_SERVICE        "org.freedesktop.Notifications"
+#define NOTIFY_PATH           "/org/freedesktop/Notifications"
+#define NOTIFY_INTERFACE      "org.freedesktop.Notifications"
+
 #define SCROLL_DEBOUNCE_MS    150
 
 #ifndef SP_INSTALL_ICON_DIR
@@ -75,18 +83,23 @@ static const char *k_sni_introspect =
     "</node>\n";
 
 static struct {
-    SpState    *state;
-    char        service_name[128];
-    char        icon_theme_path[PATH_MAX];
-    char        icon_name[64];
-    char        tooltip_title[192];
-    char        tooltip_body[128];
-    const char *menu_path;
+    SpState      *state;
+    char          service_name[128];
+    char          icon_theme_path[PATH_MAX];
+    char          icon_name[64];
+    char          tooltip_title[192];
+    char          tooltip_body[384];
+    const char   *menu_path;
 
     /* Scroll accumulation and debouncing */
-    int         scroll_accum;
-    int         scroll_pending;
-    int64_t     scroll_due_ms;
+    int           scroll_accum;
+    int           scroll_pending;
+    int64_t       scroll_due_ms;
+
+    /* OSD bus name presence & freedesktop notification replacement ID */
+    int           has_plasmashell;
+    int           has_notifications;
+    dbus_uint32_t notify_replaces_id;
 } g_sni;
 
 static int64_t monotonic_ms(void)
@@ -152,7 +165,10 @@ static void compute_icon_and_tooltip(const SpState *st,
 
     if (!st->running) {
         snprintf(icon_out, icon_cap, "screenplus-tray-stopped");
-        snprintf(body_out, body_cap, "Not running");
+        snprintf(body_out, body_cap,
+                 "Not running\n"
+                 "\n"
+                 "Right click: options");
         return;
     }
 
@@ -163,12 +179,174 @@ static void compute_icon_and_tooltip(const SpState *st,
     }
 
     const char *status_word = st->paused ? "Paused" : "Playing";
-    if (st->has_current && st->current.name[0]) {
-        snprintf(body_out, body_cap, "%s — %s", st->current.name, status_word);
-    } else {
-        snprintf(body_out, body_cap, "%s", status_word);
+    const char *wp_name = (st->has_current && st->current.name[0]) ? st->current.name : "Screen+";
+    snprintf(body_out, body_cap,
+             "%s — %s · Volume %d%%\n"
+             "\n"
+             "Left click: show / hide window\n"
+             "Middle click: pause / resume\n"
+             "Scroll: volume\n"
+             "Right click: options",
+             wp_name, status_word, st->volume);
+}
+
+/* ------------------------------------------------------------------ OSD (fire-and-forget) */
+
+static void on_notify_pending_reply(DBusPendingCall *pending, void *user_data)
+{
+    (void)user_data;
+    DBusMessage *reply = dbus_pending_call_steal_reply(pending);
+    if (reply) {
+        if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_METHOD_RETURN) {
+            dbus_uint32_t id = 0;
+            if (dbus_message_get_args(reply, NULL, DBUS_TYPE_UINT32, &id, DBUS_TYPE_INVALID) && id != 0) {
+                g_sni.notify_replaces_id = id;
+            }
+        }
+        dbus_message_unref(reply);
+    }
+    dbus_pending_call_unref(pending);
+}
+
+static void send_freedesktop_notification(DBusConnection *conn,
+                                          const char *summary,
+                                          const char *body,
+                                          int has_value,
+                                          int value_percent)
+{
+    if (!conn || !g_sni.has_notifications) return;
+
+    DBusMessage *msg = dbus_message_new_method_call(NOTIFY_SERVICE,
+                                                    NOTIFY_PATH,
+                                                    NOTIFY_INTERFACE,
+                                                    "Notify");
+    if (!msg) return;
+
+    const char *app_name = "Screen+";
+    const char *app_icon = "screenplus-tray";
+    dbus_uint32_t replaces_id = g_sni.notify_replaces_id;
+    dbus_int32_t expire_timeout = 1500;
+
+    DBusMessageIter iter, actions, hints, entry, variant;
+    dbus_message_iter_init_append(msg, &iter);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &app_name);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT32, &replaces_id);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &app_icon);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &summary);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &body);
+
+    /* actions: empty as */
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "s", &actions);
+    dbus_message_iter_close_container(&iter, &actions);
+
+    /* hints: a{sv} */
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &hints);
+
+    if (has_value) {
+        const char *k_val = "value";
+        dbus_int32_t v = (dbus_int32_t)value_percent;
+        dbus_message_iter_open_container(&hints, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &k_val);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "i", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_INT32, &v);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&hints, &entry);
+    }
+
+    const char *k_sync = "x-canonical-private-synchronous";
+    const char *v_sync = "screenplus-tray";
+    dbus_message_iter_open_container(&hints, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &k_sync);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &v_sync);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&hints, &entry);
+
+    const char *k_urg = "urgency";
+    unsigned char v_urg = 0; /* low */
+    dbus_message_iter_open_container(&hints, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &k_urg);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "y", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BYTE, &v_urg);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&hints, &entry);
+
+    dbus_message_iter_close_container(&iter, &hints);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_INT32, &expire_timeout);
+
+    DBusPendingCall *pending = NULL;
+    if (dbus_connection_send_with_reply(conn, msg, &pending, 1000) && pending) {
+        if (!dbus_pending_call_set_notify(pending, on_notify_pending_reply, NULL, NULL)) {
+            dbus_pending_call_unref(pending);
+        }
+    }
+    dbus_message_unref(msg);
+    dbus_connection_flush(conn);
+}
+
+static void show_volume_osd(DBusConnection *conn, int percent)
+{
+    if (!conn) return;
+    if (g_sni.has_plasmashell) {
+        DBusMessage *msg = dbus_message_new_method_call(PLASMASHELL_SERVICE,
+                                                        KDE_OSD_PATH,
+                                                        KDE_OSD_INTERFACE,
+                                                        "mediaPlayerVolumeChanged");
+        if (!msg) return;
+        dbus_int32_t pct = (dbus_int32_t)percent;
+        const char *player = "Screen+";
+        const char *icon = "screenplus-tray";
+        dbus_message_append_args(msg,
+                                 DBUS_TYPE_INT32, &pct,
+                                 DBUS_TYPE_STRING, &player,
+                                 DBUS_TYPE_STRING, &icon,
+                                 DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, msg, NULL);
+        dbus_message_unref(msg);
+        dbus_connection_flush(conn);
+    } else if (g_sni.has_notifications) {
+        char body[32];
+        snprintf(body, sizeof body, "%d%%", percent);
+        send_freedesktop_notification(conn, "Screen+ volume", body, 1, percent);
     }
 }
+
+static void show_pause_osd(DBusConnection *conn, int paused)
+{
+    if (!conn) return;
+    if (g_sni.has_plasmashell) {
+        DBusMessage *msg = dbus_message_new_method_call(PLASMASHELL_SERVICE,
+                                                        KDE_OSD_PATH,
+                                                        KDE_OSD_INTERFACE,
+                                                        "showText");
+        if (!msg) return;
+        const char *icon = paused ? "media-playback-pause" : "media-playback-start";
+        const char *text = paused ? "Screen+ paused" : "Screen+ playing";
+        dbus_message_append_args(msg,
+                                 DBUS_TYPE_STRING, &icon,
+                                 DBUS_TYPE_STRING, &text,
+                                 DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, msg, NULL);
+        dbus_message_unref(msg);
+        dbus_connection_flush(conn);
+    } else if (g_sni.has_notifications) {
+        send_freedesktop_notification(conn, "Screen+", paused ? "Paused" : "Playing", 0, 0);
+    }
+}
+
+void sp_sni_on_name_owner_changed(const char *name, const char *new_owner)
+{
+    if (!name) return;
+    int has = (new_owner && new_owner[0] != '\0');
+    if (!strcmp(name, PLASMASHELL_SERVICE)) {
+        g_sni.has_plasmashell = has;
+    } else if (!strcmp(name, NOTIFY_SERVICE)) {
+        g_sni.has_notifications = has;
+        if (!has) g_sni.notify_replaces_id = 0;
+    }
+}
+
+/* ------------------------------------------------------------------ D-Bus properties & handlers */
 
 static void append_dict_string(DBusMessageIter *dict, const char *key, const char *val)
 {
@@ -378,10 +556,11 @@ static void on_secondary_activate(DBusConnection *conn)
         json_free(root);
         sp_sni_sync(conn, g_sni.state, 0);
         sp_dbusmenu_sync(conn, g_sni.state, 0);
+        show_pause_osd(conn, g_sni.state->paused);
     }
 }
 
-static void on_scroll(dbus_int32_t delta, const char *orientation)
+static void on_scroll(DBusConnection *conn, dbus_int32_t delta, const char *orientation)
 {
     if (!g_sni.state || !g_sni.state->running || delta == 0) return;
     if (orientation && orientation[0] && strcasecmp(orientation, "vertical") != 0) return;
@@ -404,11 +583,17 @@ static void on_scroll(dbus_int32_t delta, const char *orientation)
     int nv = g_sni.state->volume + steps * 5;
     if (nv < 0) nv = 0;
     if (nv > 100) nv = 100;
-    if (nv == g_sni.state->volume && !g_sni.scroll_pending) return;
+    int changed = (nv != g_sni.state->volume);
 
     g_sni.state->volume = nv;
-    g_sni.scroll_pending = 1;
-    g_sni.scroll_due_ms = monotonic_ms() + SCROLL_DEBOUNCE_MS;
+    /* Update tooltip immediately (emits NewToolTip right away) and show volume OSD */
+    sp_sni_sync(conn, g_sni.state, 0);
+    show_volume_osd(conn, nv);
+
+    if (changed || g_sni.scroll_pending) {
+        g_sni.scroll_pending = 1;
+        g_sni.scroll_due_ms = monotonic_ms() + SCROLL_DEBOUNCE_MS;
+    }
 }
 
 int64_t sp_sni_tick_scroll(DBusConnection *conn, int64_t now_ms)
@@ -491,7 +676,7 @@ static DBusHandlerResult sni_message_handler(DBusConnection *conn, DBusMessage *
             dbus_connection_send(conn, reply, NULL);
             dbus_message_unref(reply);
         }
-        if (ok) on_scroll(delta, orientation);
+        if (ok) on_scroll(conn, delta, orientation);
         return DBUS_HANDLER_RESULT_HANDLED;
     }
 
@@ -526,7 +711,7 @@ void sp_sni_sync(DBusConnection *conn, const SpState *state, int force_emit)
 {
     char new_icon[64];
     char new_title[192];
-    char new_body[128];
+    char new_body[384];
 
     compute_icon_and_tooltip(state,
                              new_icon, sizeof new_icon,
@@ -561,6 +746,9 @@ int sp_sni_init(DBusConnection *conn, SpState *state, const char *menu_path)
                              g_sni.icon_name, sizeof g_sni.icon_name,
                              g_sni.tooltip_title, sizeof g_sni.tooltip_title,
                              g_sni.tooltip_body, sizeof g_sni.tooltip_body);
+
+    g_sni.has_plasmashell = dbus_bus_name_has_owner(conn, PLASMASHELL_SERVICE, NULL) ? 1 : 0;
+    g_sni.has_notifications = dbus_bus_name_has_owner(conn, NOTIFY_SERVICE, NULL) ? 1 : 0;
 
     snprintf(g_sni.service_name, sizeof g_sni.service_name,
              "org.kde.StatusNotifierItem-%d-1", (int)getpid());

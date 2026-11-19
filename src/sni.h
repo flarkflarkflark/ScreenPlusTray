@@ -15,6 +15,9 @@ int  sp_sni_init(DBusConnection *conn, SpState *state, const char *menu_path);
 /* Re-register with org.kde.StatusNotifierWatcher (called at startup and on NameOwnerChanged). */
 void sp_sni_register_watcher(DBusConnection *conn);
 
+/* Update cached owner presence for org.kde.plasmashell and org.freedesktop.Notifications. */
+void sp_sni_on_name_owner_changed(const char *name, const char *new_owner);
+
 /* Sync IconName and ToolTip from `state`. Emits NewIcon / NewToolTip ONLY when changed.
  * If force_emit is 1, emits both signals unconditionally. */
 void sp_sni_sync(DBusConnection *conn, const SpState *state, int force_emit);
