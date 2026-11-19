@@ -14,14 +14,16 @@ Install the prebuilt `x86_64` binary into `~/.local` (no compiler or `sudo` need
 curl -fsSL https://raw.githubusercontent.com/flarkflarkflark/ScreenPlusTray/master/install.sh | sh
 ```
 
-<small>Prefer to inspect the script before running it?
+<details>
+<summary>Prefer to inspect the script before running it?</summary>
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/flarkflarkflark/ScreenPlusTray/master/install.sh
 less install.sh
 sh install.sh
 ```
-</small>
+
+</details>
 
 **Update** to the latest release by running the same command again.
 
@@ -31,7 +33,7 @@ sh install.sh
 curl -fsSL https://raw.githubusercontent.com/flarkflarkflark/ScreenPlusTray/master/install.sh | sh -s -- --uninstall
 ```
 
-<small>Additional installer options (`| sh -s -- <options>`): `--no-autostart`, `--prefix DIR` (default `~/.local`), `--version vX.Y.Z`.</small>
+Additional installer options (`| sh -s -- <options>`): `--no-autostart`, `--prefix DIR` (default `~/.local`), `--version vX.Y.Z`.
 
 ---
 
