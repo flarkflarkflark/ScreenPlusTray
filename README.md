@@ -1,7 +1,7 @@
 # ScreenPlusTray (`screenplus-tray`)
 
 A lightweight, standalone Linux system tray icon (`org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`) for [Screen+](https://github.com/CoolNinja2009/ScreenPlus) on **KDE Plasma 6** and **Hyprland** (Waybar `tray` module).
-
+This in my unofficial companion tool. Not affiliated with or endorsed by the Screen+ project.
 `screenplus-tray` communicates directly with an already-installed Screen+ service over its Unix domain socket (`$XDG_RUNTIME_DIR/screenplus.sock`) without modifying Screen+ itself.
 
 ## Features
